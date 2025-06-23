@@ -1,71 +1,61 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
+from sqlalchemy.future import select
+from sqlalchemy.orm import Session
+from models import Base, VoteOption
+from database import engine, SessionLocal
+
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 app = FastAPI()
-
-# ✅ Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or ["http://localhost:5173"] for stricter config
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# In-memory data store
-votes = {
-    "Option A": 0,
-    "Option B": 0,
-    "Option C": 0,
-}
+# Initialize DB tables
+@app.on_event("startup")
+async def startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    # Optionally seed options
+    async with SessionLocal() as session:
+        options = ["Option A", "Option B", "Option C"]
+        for title in options:
+            result = await session.execute(select(VoteOption).where(VoteOption.title == title))
+            if not result.scalar():
+                session.add(VoteOption(title=title))
+        await session.commit()
 
-connections = []
+# Dependency
+async def get_db():
+    async with SessionLocal() as session:
+        yield session
 
 @app.get("/api/votes/")
-def get_votes():
-    return [{"title": k, "votes": v, "id": i + 1} for i, (k, v) in enumerate(votes.items())]
+async def get_votes(db: Session = Depends(get_db)):
+    result = await db.execute(select(VoteOption))
+    return [opt.__dict__ for opt in result.scalars()]
 
 @app.post("/api/votes/cast/")
-async def cast_vote(data: dict):
+async def cast_vote(data: dict, db: Session = Depends(get_db)):
     name = data.get("name")
     vote_id = data.get("id")
 
     if not name or not vote_id:
-        return JSONResponse(status_code=400, content={"detail": "Invalid data"})
+        return {"detail": "Invalid data"}, 400
 
-    keys = list(votes.keys())
-    if 0 < vote_id <= len(keys):
-        selected = keys[vote_id - 1]
-        votes[selected] += 1
+    result = await db.execute(select(VoteOption).where(VoteOption.id == vote_id))
+    option = result.scalar_one_or_none()
 
-        updated = {
-            "title": selected,
-            "votes": votes[selected],
-            "id": vote_id
+    if option:
+        option.votes += 1
+        await db.commit()
+        await db.refresh(option)
+        return {
+            "title": option.title,
+            "votes": option.votes,
+            "id": option.id
         }
+    return {"detail": "Invalid vote ID"}, 400
 
-        # Notify all clients via WebSocket
-        for conn in connections:
-            try:
-                await conn.send_json({
-                    "type": "update",
-                    "payload": get_votes()
-                })
-            except:
-                pass
-
-        return updated
-
-    return JSONResponse(status_code=400, content={"detail": "Invalid vote ID"})
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    connections.append(websocket)
-
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        connections.remove(websocket)
